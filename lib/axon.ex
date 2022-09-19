@@ -534,6 +534,8 @@ defmodule Axon do
   # TODO: This should not be duplicated
   defp deep_new(%Nx.Tensor{} = x, fun), do: fun.(x)
 
+  defp deep_new(x, fun) when is_number(x), do: fun.(x)
+
   defp deep_new(map, fun) do
     {cont, :ok} = Nx.Container.traverse(map, :ok, &recur_traverse(&1, &2, fun))
     cont
@@ -639,7 +641,7 @@ defmodule Axon do
         bias = param("bias", bias_shape, initializer: opts[:bias_initializer])
         {[x, kernel, bias], :dense}
       else
-        {[x, kernel, constant(0)], :dense}
+        {[x, kernel], &Axon.Layers.dense(&1, &2, 0, &3)}
       end
 
     node = layer(op, inputs, name: opts[:name], op_name: :dense)
@@ -3494,44 +3496,49 @@ defmodule Axon do
   """
   @doc type: :model
   def serialize(%Axon{} = model, params, opts \\ []) do
-    {model_meta, _op_counts} = axon_to_map(model, {%{}, %{}})
+    {_, {_seen_nodes, node_list, _op_counts}} = axon_to_map(model, {MapSet.new(), [], %{}})
     params = Nx.serialize(params, opts)
-    :erlang.term_to_binary({@file_version, model_meta, params}, opts)
+    :erlang.term_to_binary({@file_version, node_list, params}, opts)
   end
 
-  defp axon_to_map(%Axon{op_name: op, id: id} = model, {cache, op_counts} = cache_and_counts) do
-    case cache do
-      %{^id => entry} ->
-        {entry, {cache, op_counts}}
-
-      %{} ->
-        {entry, {cache, op_counts}} = recur_axon_to_map(model, cache_and_counts)
-        op_counts = Map.update(op_counts, op, 1, fn x -> x + 1 end)
-        {entry, {Map.put(cache, id, entry), op_counts}}
+  defp axon_to_map(
+         %Axon{op_name: op, id: id} = model,
+         {seen_nodes, node_list, op_counts} = nodes_and_counts
+       ) do
+    if MapSet.member?(seen_nodes, id) do
+      {id, {seen_nodes, node_list, op_counts}}
+    else
+      {node, {seen_nodes, node_list, op_counts}} = recur_axon_to_map(model, nodes_and_counts)
+      op_counts = Map.update(op_counts, op, 1, fn x -> x + 1 end)
+      {id, {MapSet.put(seen_nodes, id), [node | node_list], op_counts}}
     end
   end
 
   defp recur_axon_to_map(
          %Axon{op: :container, name: name_fn, parent: [parents]} = model,
-         cache_and_counts
+         nodes_and_counts
        ) do
-    {parents, {cache, op_counts}} = deep_map_reduce(parents, cache_and_counts, &axon_to_map/2)
+    {parent_ids, {seen_nodes, node_list, op_counts}} =
+      deep_map_reduce(parents, nodes_and_counts, &axon_to_map/2)
+
     axon_map = Map.from_struct(model) |> Map.put(:axon, :axon)
     name = name_fn.(:container, op_counts)
-    entry = %{axon_map | name: name, parent: parents}
-    {entry, {cache, op_counts}}
+    entry = %{axon_map | name: name, parent: List.wrap(parent_ids)}
+    {entry, {seen_nodes, node_list, op_counts}}
   end
 
   defp recur_axon_to_map(
-         %Axon{op_name: op, parent: parents, name: name_fn} = model,
-         cache_and_counts
+         %Axon{op: op, op_name: op_name, parent: parents, name: name_fn} = model,
+         nodes_and_counts
        ) do
-    {parents, {cache, op_counts}} = Enum.map_reduce(parents, cache_and_counts, &axon_to_map/2)
+    {parent_ids, {seen_nodes, node_list, op_counts}} =
+      Enum.map_reduce(parents, nodes_and_counts, &axon_to_map/2)
+
     axon_map = Map.from_struct(model) |> Map.put(:axon, :axon)
     name = name_fn.(op, op_counts)
     validate_serialized_op!(name, op)
-    entry = %{axon_map | parent: parents, name: name}
-    {entry, {cache, op_counts}}
+    entry = %{axon_map | name: name, parent: List.wrap(parent_ids)}
+    {entry, {seen_nodes, node_list, op_counts}}
   end
 
   # TODO: Raise on next release
@@ -3578,46 +3585,46 @@ defmodule Axon do
   """
   @doc type: :model
   def deserialize(serialized, opts \\ []) do
-    {1, model_meta, serialized_params} = :erlang.binary_to_term(serialized, opts)
-    {model, _} = map_to_axon(model_meta, %{})
+    {1, node_list, serialized_params} = :erlang.binary_to_term(serialized, opts)
+    {model, _} = node_list_to_axon(Enum.reverse(node_list))
     params = Nx.deserialize(serialized_params, opts)
     {model, params}
   end
 
-  defp map_to_axon(%{id: id} = model_meta, cache) do
-    case cache do
-      %{^id => entry} ->
-        {entry, cache}
-
-      %{} ->
-        {entry, cache} = recur_map_to_axon(model_meta, cache)
-        {entry, Map.put(cache, id, entry)}
-    end
+  defp node_list_to_axon([_ | _] = node_list) do
+    Enum.reduce(node_list, {nil, %{}}, &node_to_axon/2)
   end
 
-  defp recur_map_to_axon(%{op: :container, parent: [parents], name: name} = model, cache) do
-    {parents, cache} = deep_map_reduce(parents, cache, &map_to_axon/2)
+  defp node_to_axon(
+         %{id: id, op: :container, parent: [parent_ids], name: name} = model,
+         {_root_node, cache}
+       ) do
+    parents = deep_new(parent_ids, fn parent_id -> cache[parent_id] end)
     model = Map.drop(model, [:axon])
     name_fn = fn _, _ -> name end
     model = struct(__MODULE__, %{model | parent: List.wrap(parents), name: name_fn})
-    {model, cache}
+    {model, Map.put(cache, id, model)}
   end
 
-  defp recur_map_to_axon(%{axon: :axon, op: op, parent: parents, name: name} = model, cache) do
-    {parents, cache} = Enum.map_reduce(parents, cache, &map_to_axon/2)
+  defp node_to_axon(
+         %{id: id, op: op, op_name: op_name, parent: parent_ids, name: name} = model,
+         {_root_node, cache}
+       ) do
+    parents = Enum.map(parent_ids, fn parent_id -> cache[parent_id] end)
     model = Map.drop(model, [:axon])
-    validate_deserialized_op!(name, op)
+    validate_deserialized_op!(name, op, op_name)
     name_fn = fn _, _ -> name end
-    model = struct(__MODULE__, %{model | parent: parents, name: name_fn})
-    {model, cache}
+    model = struct(__MODULE__, %{model | parent: List.wrap(parents), name: name_fn})
+    {model, Map.put(cache, id, model)}
   end
 
   # TODO: Raise on next release
-  defp validate_deserialized_op!(name, op) when is_function(op) do
+  defp validate_deserialized_op!(name, op, op_name) when is_function(op) do
     fun_info = Function.info(op)
 
     case fun_info[:type] do
       :local ->
+        IO.inspect op_name
         Logger.warning(
           "Attempting to deserialize anonymous function in layer #{name}," <>
             " this will result in errors during deserialization between" <>
@@ -3636,7 +3643,7 @@ defmodule Axon do
     end
   end
 
-  defp validate_deserialized_op!(_name, op) when is_atom(op), do: :ok
+  defp validate_deserialized_op!(_name, op, _op_name) when is_atom(op), do: :ok
 
   ## Helpers
 
